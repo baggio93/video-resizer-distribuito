@@ -1,0 +1,14 @@
+# Ignora i file video generati o in elaborazione
+*.mp4
+tmp/
+
+# Ignora il database locale e i log
+resizer.db
+server_log.txt
+
+# Ignora il file di configurazione con le tue password/porte locali
+config.json
+
+# Ignora le cartelle di cache di Python
+__pycache__/
+*.pyc
