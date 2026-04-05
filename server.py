@@ -32,6 +32,7 @@ DEFAULT_CONFIG = {
     "RESIZE_ARGS": ["-vf", "scale=-1:720", "-c:v", "libx264", "-c:a", "copy"],
     "LOG_FILE": "server_log.txt",
     "SCAN_DIR": ".",
+    "DB_PATH": "resizer.db",
     "DASHBOARD_PASSWORD": hash_password("admin") 
 }
 
@@ -53,9 +54,15 @@ elif len(config["DASHBOARD_PASSWORD"]) != 64:
     config["DASHBOARD_PASSWORD"] = hash_password(config["DASHBOARD_PASSWORD"])
     aggiorna_config = True
 
+if "DB_PATH" not in config:
+    config["DB_PATH"] = "resizer.db"
+    aggiorna_config = True
+
 if aggiorna_config:
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=4)
+
+database.set_db_path(config["DB_PATH"])
 
 is_paused = False
 
@@ -84,6 +91,11 @@ def generate_benchmark():
 async def scan_and_process():
     while True:
         try:
+            deleted_clients = database.cleanup_inactive_clients(time.time())
+            if deleted_clients > 0:
+                log_to_file(f"Pulizia automatica: {deleted_clients} client inattivi rimossi (Timeout).")
+                print(f"Pulizia automatica: {deleted_clients} client inattivi rimossi.")
+
             if is_paused:
                 await asyncio.sleep(5)
                 continue
@@ -233,6 +245,7 @@ class ConfigUpdate(BaseModel):
     RESIZE_ARGS: List[str]
     SCAN_DIR: str 
     DASHBOARD_PASSWORD: str = "" 
+    DB_PATH: str 
 
 class PauseState(BaseModel):
     paused: bool
@@ -337,6 +350,10 @@ def update_config(new_config: ConfigUpdate):
     config["RESIZE_ARGS"] = new_config.RESIZE_ARGS
     config["SCAN_DIR"] = new_config.SCAN_DIR
     
+    config["DB_PATH"] = new_config.DB_PATH.strip() or "resizer.db"
+    database.set_db_path(config["DB_PATH"])
+    database.init_db() 
+    
     if new_config.DASHBOARD_PASSWORD.strip() != "":
         config["DASHBOARD_PASSWORD"] = hash_password(new_config.DASHBOARD_PASSWORD.strip())
     
@@ -358,13 +375,16 @@ def get_benchmark():
         return FileResponse(file_path)
     raise HTTPException(status_code=404, detail="Benchmark not found")
 
+# --- MODIFICA: Cattura l'IP dal request del client
 @app.post("/benchmark_result")
-def post_benchmark_result(data: BenchmarkResult):
-    database.save_client_benchmark(data.client_id, data.benchmark_time)
+def post_benchmark_result(data: BenchmarkResult, request: Request):
+    client_ip = request.client.host
+    database.save_client_benchmark(data.client_id, data.benchmark_time, client_ip)
     return {"status": "ok"}
 
+# --- MODIFICA: Cattura l'IP dal request del client
 @app.get("/get_chunk")
-def get_chunk(client_id: str):
+def get_chunk(client_id: str, request: Request):
     if is_paused:
         raise HTTPException(status_code=404, detail="Server in pausa. Nessun chunk erogato.")
 
@@ -373,6 +393,8 @@ def get_chunk(client_id: str):
         raise HTTPException(status_code=400, detail="Client non registrato. Fai prima il benchmark.")
         
     current_time = time.time()
+    client_ip = request.client.host
+    database.update_client_last_seen(client_id, current_time, client_ip)
     
     stale_chunks = database.get_stale_chunks(current_time)
     for stale in stale_chunks:
@@ -385,7 +407,7 @@ def get_chunk(client_id: str):
     if not chunk:
         raise HTTPException(status_code=404, detail="No chunks available")
         
-    msg_assign = f"Assegnato chunk ID {chunk['id']} (file: {chunk['chunk_filename']}) al client {client_id}"
+    msg_assign = f"Assegnato chunk ID {chunk['id']} (file: {chunk['chunk_filename']}) al client {client_id} (IP: {client_ip})"
     print(msg_assign)
     log_to_file(msg_assign)
         
@@ -394,8 +416,12 @@ def get_chunk(client_id: str):
         headers={"X-Chunk-Id": str(chunk['id'])}
     )
 
+# --- MODIFICA: Cattura l'IP dal request del client
 @app.post("/upload_chunk")
-async def upload_chunk(client_id: str = Form(...), chunk_id: int = Form(...), file: UploadFile = File(...)):
+async def upload_chunk(request: Request, client_id: str = Form(...), chunk_id: int = Form(...), file: UploadFile = File(...)):
+    client_ip = request.client.host
+    database.update_client_last_seen(client_id, time.time(), client_ip)
+    
     chunk = database.get_chunk_by_id(chunk_id)
     if not chunk:
         raise HTTPException(status_code=400, detail="Chunk not found")
@@ -413,9 +439,9 @@ async def upload_chunk(client_id: str = Form(...), chunk_id: int = Form(...), fi
     mancanti = database.get_remaining_chunks_count(video_id)
     
     if mancanti > 0:
-        messaggio = f"Ricevuto chunk ID {chunk_id} dal client. Mancano {mancanti} pezzi al termine."
+        messaggio = f"Ricevuto chunk ID {chunk_id} dal client {client_ip}. Mancano {mancanti} pezzi al termine."
     else:
-        messaggio = f"Ricevuto chunk ID {chunk_id} dal client. TUTTI I PEZZI RICEVUTI!"
+        messaggio = f"Ricevuto chunk ID {chunk_id} dal client {client_ip}. TUTTI I PEZZI RICEVUTI!"
         
     print(messaggio)
     log_to_file(messaggio)
@@ -516,12 +542,16 @@ def get_dashboard(request: Request):
                         <input type="text" id="cfg-scan" placeholder=". (Cartella corrente)">
                     </div>
                     <div class="form-group">
-                        <label>Password Dashboard:</label>
-                        <input type="password" id="cfg-pass" placeholder="Lascia vuoto per non cambiare">
+                        <label>Percorso Database (DB_PATH):</label>
+                        <input type="text" id="cfg-db" placeholder="resizer.db">
                     </div>
                     <div class="form-group">
                         <label>Nome File Log:</label>
                         <input type="text" id="cfg-log">
+                    </div>
+                    <div class="form-group">
+                        <label>Password Dashboard:</label>
+                        <input type="password" id="cfg-pass" placeholder="Lascia vuoto per non cambiare">
                     </div>
                     <div class="form-group" style="grid-column: 1 / -1;">
                         <label>Argomenti FFmpeg (Array in JSON):</label>
@@ -538,11 +568,7 @@ def get_dashboard(request: Request):
                 <span>📦 Video Totali: <strong id="vid-total">0</strong></span>
             </div>
 
-            <div class="metric" style="margin-bottom: 15px; border-bottom: none; display: flex; flex-direction: column; gap: 10px;">
-                <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <span>👥 Client Attivi Totali:</span>
-                    <strong id="active-clients" style="color: #e91e63; font-size: 1.2em;">0</strong>
-                </div>
+            <div class="metric" style="margin-bottom: 30px; border-bottom: none; display: flex; flex-direction: column; gap: 10px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; border-top: 1px dashed #3d3d5c; padding-top: 10px;">
                     <span>📁 Cartella in Scansione:</span>
                     <strong id="scan-dir" style="color: #ffeb3b; font-size: 0.85em; word-break: break-all; text-align: right; max-width: 60%;">-</strong>
@@ -561,6 +587,14 @@ def get_dashboard(request: Request):
                         <div id="global-bar-fill" class="bar-fill" style="width: 0%; background: linear-gradient(90deg, #2196f3, #64b5f6);">0%</div>
                     </div>
                 </div>
+            </div>
+
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 2px solid #3d3d5c; padding-bottom: 10px;">
+                <h3 style="margin: 0; color: #bbb;">💻 Client Operativi (<span id="clients-count">0</span>)</h3>
+            </div>
+            
+            <div id="clients-container" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 15px; margin-bottom: 35px;">
+                <p style="color: #777;">Caricamento stato client...</p>
             </div>
 
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 2px solid #3d3d5c; padding-bottom: 10px;">
@@ -656,6 +690,7 @@ def get_dashboard(request: Request):
                     document.getElementById('cfg-split').value = cfg.SPLIT_SECONDS;
                     document.getElementById('cfg-log').value = cfg.LOG_FILE;
                     document.getElementById('cfg-scan').value = cfg.SCAN_DIR || ".";
+                    document.getElementById('cfg-db').value = cfg.DB_PATH || "resizer.db";
                     document.getElementById('cfg-args').value = JSON.stringify(cfg.RESIZE_ARGS);
                 } catch (e) { console.error("Errore config:", e); }
             }
@@ -672,6 +707,7 @@ def get_dashboard(request: Request):
                         NOME_FILE_BENCHMARK: "benchmark.mp4", 
                         LOG_FILE: document.getElementById('cfg-log').value,
                         SCAN_DIR: document.getElementById('cfg-scan').value || ".",
+                        DB_PATH: document.getElementById('cfg-db').value || "resizer.db",
                         RESIZE_ARGS: parsedArgs,
                         DASHBOARD_PASSWORD: document.getElementById('cfg-pass').value 
                     };
@@ -724,14 +760,12 @@ def get_dashboard(request: Request):
                         pauseBanner.style.display = "none";    
                     }
 
-                    document.getElementById('active-clients').innerText = stats.client_attivi;
                     document.getElementById('scan-dir').innerText = stats.cartella_scansione || ".";
                     
                     if (stats.global_eta_seconds !== undefined) {
                         document.getElementById('global-eta').innerText = formatETA(stats.global_eta_seconds);
                     }
                     
-                    // AGGIORNAMENTO PROGRESSO GLOBALE 
                     let globalPerc = 0;
                     if (stats.global_totali > 0) {
                         globalPerc = Math.round((stats.global_completati / stats.global_totali) * 100);
@@ -739,6 +773,36 @@ def get_dashboard(request: Request):
                     document.getElementById('global-perc-text').innerText = globalPerc + '%';
                     document.getElementById('global-bar-fill').style.width = globalPerc + '%';
                     document.getElementById('global-bar-fill').innerText = globalPerc + '%';
+                    
+                    document.getElementById('clients-count').innerText = stats.client_attivi;
+                    const clientsContainer = document.getElementById('clients-container');
+                    
+                    if (stats.client_list && stats.client_list.length > 0) {
+                        let clientsHtml = "";
+                        stats.client_list.forEach(c => {
+                            let idShort = c.client_id.split('-')[0];
+                            let bTime = c.benchmark_time.toFixed(1);
+                            
+                            let limitWarning = 5 * c.benchmark_time;
+                            let statusColor = c.seconds_ago > limitWarning ? "#ff9800" : "#4caf50";
+                            let icon = c.seconds_ago > limitWarning ? "⏳" : "🟢";
+                            
+                            // MODIFICA: Recupero l'IP del client per mostrarlo nell'HTML
+                            let ipInfo = c.ip_address ? c.ip_address : "Sconosciuto";
+                            
+                            clientsHtml += `
+                            <div style="background: #151521; padding: 15px; border-radius: 8px; border: 1px solid #3d3d5c; border-left: 4px solid ${statusColor};">
+                                <div style="font-weight: bold; margin-bottom: 5px;">${icon} ID: ${idShort}</div>
+                                <div style="font-size: 0.85em; color: #2196f3; margin-bottom: 5px;">🌐 IP: ${ipInfo}</div>
+                                <div style="font-size: 0.9em; color: #bbb;">⚡ Vel: ${bTime}s / pezzo</div>
+                                <div style="font-size: 0.8em; margin-top: 5px; color: ${statusColor};">⏱️ Ping: ${c.seconds_ago} sec fa</div>
+                            </div>
+                            `;
+                        });
+                        clientsContainer.innerHTML = clientsHtml;
+                    } else {
+                        clientsContainer.innerHTML = "<p style='color: #777; grid-column: 1 / -1;'>Nessun client attualmente connesso.</p>";
+                    }
                     
                     const totalVideos = stats.videos.length;
                     const completedVideos = stats.videos.filter(v => v.status === 'completato').length;

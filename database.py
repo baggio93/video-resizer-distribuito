@@ -2,14 +2,19 @@ import sqlite3
 import os
 import time
 
-# Percorso in cui verrà salvato il database SQLite
+# Percorso predefinito (verrà sovrascritto dal server all'avvio)
 DB_PATH = 'resizer.db' 
+
+def set_db_path(path):
+    """Permette al server di impostare il percorso del database dal config.json"""
+    global DB_PATH
+    DB_PATH = path
 
 def clean_db():
     if os.path.exists(DB_PATH):
         try:
             os.remove(DB_PATH)
-            print("Database precedente rimosso con successo.")
+            print(f"Database precedente ({DB_PATH}) rimosso con successo.")
         except Exception as e:
             print(f"Impossibile rimuovere il database: {e}")
 
@@ -25,9 +30,17 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS Clients (
             client_id TEXT PRIMARY KEY,
-            benchmark_time REAL
+            benchmark_time REAL,
+            last_seen REAL,
+            ip_address TEXT
         )
     ''')
+    
+    # Trucchetto: Prova ad aggiungere la colonna se il database vecchio non ce l'ha!
+    try:
+        cursor.execute('ALTER TABLE Clients ADD COLUMN ip_address TEXT')
+    except sqlite3.OperationalError:
+        pass # Se dà errore significa che la colonna c'è già, tutto ok!
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS Videos (
@@ -56,14 +69,15 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_client_benchmark(client_id, benchmark_time):
+def save_client_benchmark(client_id, benchmark_time, ip_address):
     conn = get_connection()
     cursor = conn.cursor()
+    current_time = time.time()
     cursor.execute('''
-        INSERT INTO Clients (client_id, benchmark_time)
-        VALUES (?, ?)
-        ON CONFLICT(client_id) DO UPDATE SET benchmark_time=excluded.benchmark_time
-    ''', (client_id, benchmark_time))
+        INSERT INTO Clients (client_id, benchmark_time, last_seen, ip_address)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(client_id) DO UPDATE SET benchmark_time=excluded.benchmark_time, last_seen=excluded.last_seen, ip_address=excluded.ip_address
+    ''', (client_id, benchmark_time, current_time, ip_address))
     conn.commit()
     conn.close()
 
@@ -74,6 +88,42 @@ def get_client(client_id):
     client = cursor.fetchone()
     conn.close()
     return client
+
+def update_client_last_seen(client_id, current_time, ip_address):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE Clients SET last_seen = ?, ip_address = ? WHERE client_id = ?', (current_time, ip_address, client_id))
+    conn.commit()
+    conn.close()
+
+def cleanup_inactive_clients(current_time):
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT client_id FROM Clients 
+        WHERE (? - last_seen) > (10 * benchmark_time)
+    ''', (current_time,))
+    
+    da_eliminare = [row['client_id'] for row in cursor.fetchall()]
+    
+    if da_eliminare:
+        placeholders = ','.join(['?'] * len(da_eliminare))
+        cursor.execute(f'''
+            UPDATE Chunks 
+            SET status = 'in_attesa', client_id = NULL, start_time = NULL 
+            WHERE status = 'in_esecuzione' AND client_id IN ({placeholders})
+        ''', da_eliminare)
+        
+        cursor.execute(f'''
+            DELETE FROM Clients 
+            WHERE client_id IN ({placeholders})
+        ''', da_eliminare)
+        
+        conn.commit()
+        
+    conn.close()
+    return len(da_eliminare)
 
 def insert_video(filename):
     conn = get_connection()
@@ -236,7 +286,6 @@ def assign_pending_chunk(client_id, current_time):
                 
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower():
-                print(f"Database occupato da un altro client. Attesa di 2 secondi (Tentativo {tentativo+1}/{max_tentativi})...")
                 time.sleep(2) 
             else:
                 raise e
@@ -274,26 +323,28 @@ def get_dashboard_stats():
     
     stats = {
         "client_attivi": 0,
+        "client_list": [],
         "videos": [],
         "global_eta_seconds": 0,
-        "global_totali": 0,       # <--- NUOVO PER BARRA GLOBALE
-        "global_completati": 0    # <--- NUOVO PER BARRA GLOBALE
+        "global_totali": 0,       
+        "global_completati": 0    
     }
     
-    cursor.execute('''
-        SELECT DISTINCT c.client_id, c.benchmark_time 
-        FROM Clients c
-        JOIN Chunks ch ON c.client_id = ch.client_id
-        WHERE ch.status = 'in_esecuzione'
-    ''')
-    active_clients = cursor.fetchall()
-    stats['client_attivi'] = len(active_clients)
+    current_time = time.time()
+    # Adesso peschiamo anche l'IP!
+    cursor.execute('SELECT client_id, benchmark_time, last_seen, ip_address FROM Clients ORDER BY last_seen DESC')
+    clients_db = cursor.fetchall()
     
     network_cps = 0.0 
-    for client in active_clients:
-        b_time = client['benchmark_time']
-        if b_time and b_time > 0:
-            network_cps += 1.0 / b_time
+    for row in clients_db:
+        client_info = dict(row)
+        client_info['seconds_ago'] = round(current_time - client_info['last_seen'])
+        stats['client_list'].append(client_info)
+        
+        if client_info['benchmark_time'] and client_info['benchmark_time'] > 0:
+            network_cps += 1.0 / client_info['benchmark_time']
+            
+    stats['client_attivi'] = len(clients_db)
             
     cursor.execute("SELECT * FROM Videos ORDER BY priorita DESC, id ASC")
     videos = cursor.fetchall()
@@ -329,17 +380,14 @@ def get_dashboard_stats():
             elif stato == 'in_attesa':
                 video_stat['in_attesa'] = conteggio
                 
-        # Conta quanti chunk totali rimangono
         if video_stat['status'] != 'completato':
             total_pending_chunks += (video_stat['in_attesa'] + video_stat['in_esecuzione'])
 
-        # Somma totale per la barra globale
         stats['global_totali'] += video_stat['totali']
         stats['global_completati'] += video_stat['completati']
                 
         stats["videos"].append(video_stat)
     
-    # --- CALCOLO ETA GLOBALE ---
     if total_pending_chunks > 0:
         if network_cps > 0:
             stats['global_eta_seconds'] = total_pending_chunks / network_cps

@@ -4,13 +4,14 @@ import uuid
 import requests
 import subprocess
 import shutil
-import signal  # <--- NUOVA LIBRERIA PER INTERCETTARE CTRL+C
-import sys     # <--- NUOVA LIBRERIA PER L'USCITA
+import signal
+import sys
 
 # --- VARIABILI GLOBALI ---
 SERVER_URL = "http://127.0.0.1:50123"
 CLIENT_ID = str(uuid.uuid4())
-keep_running = True  # Variabile che tiene in vita il ciclo del client
+keep_running = True  
+server_config = {}   # Conterrà le configurazioni scaricate dal server
 
 # --- GESTIONE DELLA CHIUSURA SICURA (CTRL+C) ---
 def signal_handler(sig, frame):
@@ -24,34 +25,25 @@ def signal_handler(sig, frame):
         print("\n💀 Chiusura forzata!")
         sys.exit(0)
 
-# Diciamo a Python di usare la nostra funzione quando l'utente preme Ctrl+C
 signal.signal(signal.SIGINT, signal_handler)
 # -----------------------------------------------
 
 def clean_leftover_files():
-    """Pulisce i file temporanei rimasti da esecuzioni precedenti."""
     print("--- PULIZIA INIZIALE ---")
     files_to_check = ["local_benchmark.mp4", "local_benchmark_out.mp4"]
     for file in os.listdir('.'):
         if file in files_to_check or file.startswith("chunk_in_") or file.startswith("chunk_out_"):
             try:
                 os.remove(file)
-                print(f"[{time.strftime('%H:%M:%S')}] Rimosso vecchio file residuo: {file}")
+                print(f"[{time.strftime('%H:%M:%S')}] Rimosso file residuo: {file}")
             except Exception as e:
                 print(f"[{time.strftime('%H:%M:%S')}] Impossibile rimuovere il file {file}: {e}")
     print("Pulizia completata.\n------------------------\n")
 
-if __name__ == "__main__":
-    print("--- Configurazione Client Video Resizer ---")
-    server_ip = input("Inserisci l'indirizzo IP o hostname del server (predefinito 127.0.0.1): ").strip() or "127.0.0.1"
-    server_port = input("Inserisci la porta del server (predefinita 50123): ").strip() or "50123"
-    SERVER_URL = f"http://{server_ip}:{server_port}"
-    
-    clean_leftover_files()
-    
-    # 1. Recupera la configurazione dal server
+def scarica_configurazioni():
+    global server_config
     try:
-        print("Connessione al server per scaricare le configurazioni...")
+        print("Scaricamento configurazioni aggiornate dal server...")
         cfg_res = requests.get(f"{SERVER_URL}/config")
         cfg_res.raise_for_status()
         server_config = cfg_res.json()
@@ -59,10 +51,10 @@ if __name__ == "__main__":
         print(f"Impossibile contattare il server su {SERVER_URL}: {e}")
         sys.exit(1)
 
-    # 2. Esecuzione del Benchmark iniziale
-    print("\n--- AVVIO BENCHMARK ---")
+def run_benchmark():
+    """Scarica il file, testa la velocità della CPU e si registra al server"""
+    print("\n--- AVVIO BENCHMARK/REGISTRAZIONE ---")
     try:
-        print("Scaricamento file di test dal server...")
         res = requests.get(f"{SERVER_URL}/benchmark", stream=True)
         res.raise_for_status()
         with open("local_benchmark.mp4", "wb") as f:
@@ -74,31 +66,47 @@ if __name__ == "__main__":
         subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elapsed = time.time() - start_time
 
-        print(f"Benchmark completato in {elapsed:.2f} secondi!")
-
         print("Invio risultato al server...")
         requests.post(f"{SERVER_URL}/benchmark_result", json={"client_id": CLIENT_ID, "benchmark_time": elapsed})
 
         if os.path.exists("local_benchmark.mp4"): os.remove("local_benchmark.mp4")
         if os.path.exists("local_benchmark_out.mp4"): os.remove("local_benchmark_out.mp4")
         
-        print("--- BENCHMARK CONCLUSO ---\n")
+        print(f"--- BENCHMARK CONCLUSO: {elapsed:.2f} sec ---\n")
     except Exception as e:
         print(f"Errore critico durante il benchmark: {e}")
-        sys.exit(1)
+        # Invece di uscire forzatamente, aspettiamo un po' e proviamo a continuare, magari il server è appena ripartito.
+        time.sleep(5)
 
-    # 3. Ciclo infinito di elaborazione pezzi
+if __name__ == "__main__":
+    print("--- Configurazione Client Video Resizer ---")
+    server_ip = input("Inserisci l'indirizzo IP o hostname del server (predefinito 127.0.0.1): ").strip() or "127.0.0.1"
+    server_port = input("Inserisci la porta del server (predefinita 50123): ").strip() or "50123"
+    SERVER_URL = f"http://{server_ip}:{server_port}"
+    
+    clean_leftover_files()
+    
+    # Primo caricamento
+    scarica_configurazioni()
+    run_benchmark()
+
     print("In attesa di video da elaborare. Premi Ctrl+C per fermare il client in modo sicuro.\n")
     
-    # Invece di "while True", usiamo la variabile globale!
     while keep_running:
         try:
-            # Chiede un pezzo al server (Timeout 5 secondi per non bloccarsi)
             res = requests.get(f"{SERVER_URL}/get_chunk", params={"client_id": CLIENT_ID}, timeout=5)
             
+            # --- FUNZIONE DI AUTO-RECOVERY ---
+            # Se il server risponde con Errore 400 (Client non registrato)
+            if res.status_code == 400:
+                print(f"[{time.strftime('%H:%M:%S')}] ⚠️ Il server ha perso la mia registrazione (Errore 400).")
+                print("Eseguo nuovamente la registrazione (Auto-Recovery)...")
+                scarica_configurazioni() 
+                run_benchmark()
+                continue
+            # ---------------------------------
+            
             if res.status_code == 404:
-                # Se il server è in pausa o non ha pezzi, fa un respiro breve e riprova
-                # Questo for permette di interrompere l'attesa se si preme Ctrl+C
                 for _ in range(5):
                     if not keep_running: break
                     time.sleep(1)
@@ -114,14 +122,12 @@ if __name__ == "__main__":
             input_chunk = f"chunk_in_{chunk_id}.mp4"
             output_chunk = f"chunk_out_{chunk_id}.mp4"
 
-            # Scarica il pezzo da elaborare
             with open(input_chunk, "wb") as f:
                 for chunk in res.iter_content(chunk_size=8192):
                     f.write(chunk)
 
             print(f"[{time.strftime('%H:%M:%S')}] Ricevuto pezzo ID {chunk_id}. Avvio elaborazione...")
             
-            # Elaborazione FFmpeg
             args = ["ffmpeg", "-y", "-i", input_chunk] + server_config["RESIZE_ARGS"] + [output_chunk]
             subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
@@ -132,7 +138,6 @@ if __name__ == "__main__":
 
             print(f"[{time.strftime('%H:%M:%S')}] Pezzo ID {chunk_id} convertito. Upload al server in corso...")
             
-            # Invio file al server
             with open(output_chunk, "rb") as f:
                 upload_res = requests.post(
                     f"{SERVER_URL}/upload_chunk",
@@ -145,7 +150,6 @@ if __name__ == "__main__":
             else:
                 print(f"[{time.strftime('%H:%M:%S')}] Pezzo {chunk_id} consegnato con successo!")
 
-            # Pulizia file locali
             if os.path.exists(input_chunk): os.remove(input_chunk)
             if os.path.exists(output_chunk): os.remove(output_chunk)
 
@@ -160,5 +164,4 @@ if __name__ == "__main__":
                 if not keep_running: break
                 time.sleep(1)
                 
-    # Se il ciclo "while" termina (perché keep_running è diventato False), il programma arriva qui
     print("\n👋 Client terminato in modo sicuro. Nessun lavoro è andato perso! A presto.")
