@@ -16,12 +16,14 @@ import database
 import datetime
 
 def log_to_file(message):
+    """Scrive un messaggio nei log aggiungendo il timestamp in automatico."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_file_path = config.get("LOG_FILE", "server_log.txt")
     with open(log_file_path, "a", encoding="utf-8") as log_file:
         log_file.write(f"[{timestamp}] {message}\n")
 
 def hash_password(password: str) -> str:
+    """Restituisce l'hash SHA-256 della stringa fornita."""
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
 CONFIG_FILE = "config.json"
@@ -33,6 +35,8 @@ DEFAULT_CONFIG = {
     "LOG_FILE": "server_log.txt",
     "SCAN_DIR": ".",
     "DB_PATH": "resizer.db",
+    "INPUT_EXT": ".mp4",
+    "OUTPUT_EXT": ".mp4",
     "DASHBOARD_PASSWORD": hash_password("admin") 
 }
 
@@ -58,6 +62,11 @@ if "DB_PATH" not in config:
     config["DB_PATH"] = "resizer.db"
     aggiorna_config = True
 
+if "INPUT_EXT" not in config:
+    config["INPUT_EXT"] = ".mp4"
+    config["OUTPUT_EXT"] = ".mp4"
+    aggiorna_config = True
+
 if aggiorna_config:
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=4)
@@ -67,14 +76,17 @@ database.set_db_path(config["DB_PATH"])
 is_paused = False
 
 def is_authenticated(request: Request):
+    """Verifica se il cookie di sessione coincide con la password hashata."""
     token = request.cookies.get("auth_token")
     return token == config.get("DASHBOARD_PASSWORD")
 
 def verify_auth(request: Request):
+    """Solleva un'eccezione HTTP se l'utente tenta di accedere a una risorsa senza login."""
     if not is_authenticated(request):
         raise HTTPException(status_code=401, detail="Non autorizzato. Effettua il login.")
 
 def generate_benchmark():
+    """Genera il file video standard per testare le prestazioni dei client."""
     file_path = config["NOME_FILE_BENCHMARK"]
     split_seconds = config.get("SPLIT_SECONDS", 30)
     
@@ -89,6 +101,7 @@ def generate_benchmark():
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 async def scan_and_process():
+    """Task infinito: gestisce in background scansione, elaborazione e unione file."""
     while True:
         try:
             deleted_clients = database.cleanup_inactive_clients(time.time())
@@ -101,6 +114,8 @@ async def scan_and_process():
                 continue
 
             current_scan_dir = config.get("SCAN_DIR", ".")
+            in_ext = config.get("INPUT_EXT", ".mp4").lower()
+            out_ext = config.get("OUTPUT_EXT", ".mp4").lower()
             
             if os.path.isdir(current_scan_dir):
                 all_videos = database.get_all_videos()
@@ -125,7 +140,7 @@ async def scan_and_process():
                         database.delete_video(video_id)
                         
                 for f in os.listdir(current_scan_dir):
-                    if f.lower().endswith(".mp4") and not f.startswith("chunk_") and f != config.get("NOME_FILE_BENCHMARK", "benchmark.mp4"):
+                    if f.lower().endswith(in_ext) and not f.startswith("chunk_") and f != config.get("NOME_FILE_BENCHMARK", "benchmark.mp4"):
                         full_path = os.path.join(current_scan_dir, f)
                         database.insert_video(full_path)
             
@@ -136,8 +151,7 @@ async def scan_and_process():
                 tmp_dir = os.path.join(current_scan_dir, "tmp")
                 os.makedirs(tmp_dir, exist_ok=True)
                 
-                filename_base = os.path.splitext(os.path.basename(filepath))[0]
-                chunk_pattern = os.path.join(tmp_dir, f"{video_id}_%04d.mp4")
+                chunk_pattern = os.path.join(tmp_dir, f"{video_id}_%04d{in_ext}")
                 
                 messaggio_split = f"Avvio split del video: {filepath}..."
                 print(messaggio_split)
@@ -153,7 +167,7 @@ async def scan_and_process():
                 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 
                 for chunk_file in sorted(os.listdir(tmp_dir)):
-                    if chunk_file.startswith(f"{video_id}_") and chunk_file.endswith(".mp4"):
+                    if chunk_file.startswith(f"{video_id}_") and chunk_file.endswith(in_ext):
                         chunk_full_path = os.path.join(tmp_dir, chunk_file)
                         database.insert_chunk(video_id, chunk_full_path)
                 
@@ -180,7 +194,7 @@ async def scan_and_process():
                             safe_path = os.path.abspath(chunk['chunk_filename']).replace('\\', '/')
                             lf.write(f"file '{safe_path}'\n")
                     
-                    output_file = filepath + ".merged.mp4"
+                    output_file = filepath + ".merged" + out_ext
                     
                     subprocess.run([
                         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file_path,
@@ -190,7 +204,15 @@ async def scan_and_process():
                     if os.path.exists(output_file):
                         final_size = os.path.getsize(output_file)
                         database.update_video_final_size(video_id, final_size)
-                        os.replace(output_file, filepath)
+                        
+                        base_name = os.path.splitext(filepath)[0]
+                        final_filepath = base_name + out_ext
+                        
+                        if filepath != final_filepath and os.path.exists(filepath):
+                            os.remove(filepath)
+                            
+                        os.replace(output_file, final_filepath)
+                        database.update_video_filename(video_id, final_filepath)
                     
                     for chunk in chunks:
                         if os.path.exists(chunk['chunk_filename']):
@@ -212,6 +234,7 @@ async def scan_and_process():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Gestisce il ciclo di vita all'avvio e allo spegnimento del server."""
     print("\n--- INIZIALIZZAZIONE AMBIENTE ---")
     database.clean_db()
     database.init_db()               
@@ -244,8 +267,10 @@ class ConfigUpdate(BaseModel):
     LOG_FILE: str
     RESIZE_ARGS: List[str]
     SCAN_DIR: str 
-    DASHBOARD_PASSWORD: str = "" 
     DB_PATH: str 
+    INPUT_EXT: str
+    OUTPUT_EXT: str
+    DASHBOARD_PASSWORD: str = "" 
 
 class PauseState(BaseModel):
     paused: bool
@@ -257,6 +282,7 @@ class PriorityUpdate(BaseModel):
 
 @app.get("/login", response_class=HTMLResponse)
 def get_login_page(request: Request, error: str = ""):
+    """Mostra la pagina per l'inserimento della password di sicurezza."""
     if is_authenticated(request):
         return RedirectResponse(url="/", status_code=303)
         
@@ -294,6 +320,7 @@ def get_login_page(request: Request, error: str = ""):
 
 @app.post("/login")
 def do_login(password: str = Form(...)):
+    """Verifica le credenziali ed emette il cookie di autorizzazione."""
     hashed_input = hash_password(password)
     if hashed_input == config.get("DASHBOARD_PASSWORD"):
         response = RedirectResponse(url="/", status_code=303)
@@ -304,12 +331,14 @@ def do_login(password: str = Form(...)):
 
 @app.get("/logout")
 def do_logout():
+    """Rimuove il cookie di sessione portando l'utente al logout."""
     response = RedirectResponse(url="/login", status_code=303)
     response.delete_cookie("auth_token")
     return response
 
 @app.get("/download_client")
 def download_client():
+    """Fornisce il download diretto dello script Python del client."""
     client_file = "client.py"
     if os.path.exists(client_file):
         return FileResponse(path=client_file, filename="client.py", media_type="text/x-python")
@@ -317,6 +346,7 @@ def download_client():
 
 @app.post("/set_priority", dependencies=[Depends(verify_auth)])
 def set_priority(data: PriorityUpdate):
+    """Scambia la priorità tra normale ed elevata per un dato video."""
     database.set_video_priority(data.video_id, data.priorita)
     stato = "ALTA" if data.priorita > 0 else "NORMALE"
     msg = f"Priorità modificata in {stato} per il video ID {data.video_id}."
@@ -326,6 +356,7 @@ def set_priority(data: PriorityUpdate):
 
 @app.post("/set_pause", dependencies=[Depends(verify_auth)])
 def set_pause(state: PauseState):
+    """Sospende momentaneamente l'erogazione dei chunk e lo split ai client."""
     global is_paused
     is_paused = state.paused
     stato_str = "PAUSA (Niente più scansioni o invio file)" if is_paused else "ATTIVO"
@@ -336,6 +367,7 @@ def set_pause(state: PauseState):
 
 @app.get("/config")
 def get_config():
+    """Fornisce ai client e alla dashboard le variabili di configurazione escludendo le password."""
     safe_config = config.copy()
     if "DASHBOARD_PASSWORD" in safe_config:
         del safe_config["DASHBOARD_PASSWORD"]
@@ -343,12 +375,15 @@ def get_config():
 
 @app.post("/update_config", dependencies=[Depends(verify_auth)])
 def update_config(new_config: ConfigUpdate):
+    """Riceve un json di configurazione aggiornato e lo applica in tempo reale."""
     global config
     config["SPLIT_SECONDS"] = new_config.SPLIT_SECONDS
     config["NOME_FILE_BENCHMARK"] = new_config.NOME_FILE_BENCHMARK
     config["LOG_FILE"] = new_config.LOG_FILE
     config["RESIZE_ARGS"] = new_config.RESIZE_ARGS
     config["SCAN_DIR"] = new_config.SCAN_DIR
+    config["INPUT_EXT"] = new_config.INPUT_EXT
+    config["OUTPUT_EXT"] = new_config.OUTPUT_EXT
     
     config["DB_PATH"] = new_config.DB_PATH.strip() or "resizer.db"
     database.set_db_path(config["DB_PATH"])
@@ -370,21 +405,22 @@ def update_config(new_config: ConfigUpdate):
 
 @app.get("/benchmark")
 def get_benchmark():
+    """Eroga il file del benchmark iniziale ai client."""
     file_path = config["NOME_FILE_BENCHMARK"]
     if os.path.exists(file_path):
         return FileResponse(file_path)
     raise HTTPException(status_code=404, detail="Benchmark not found")
 
-# --- MODIFICA: Cattura l'IP dal request del client
 @app.post("/benchmark_result")
 def post_benchmark_result(data: BenchmarkResult, request: Request):
+    """Registra nel DB il tempo impiegato da un client ed estrae il suo IP."""
     client_ip = request.client.host
     database.save_client_benchmark(data.client_id, data.benchmark_time, client_ip)
     return {"status": "ok"}
 
-# --- MODIFICA: Cattura l'IP dal request del client
 @app.get("/get_chunk")
 def get_chunk(client_id: str, request: Request):
+    """Restituisce un chunk fisico da convertire al client autorizzato."""
     if is_paused:
         raise HTTPException(status_code=404, detail="Server in pausa. Nessun chunk erogato.")
 
@@ -416,9 +452,9 @@ def get_chunk(client_id: str, request: Request):
         headers={"X-Chunk-Id": str(chunk['id'])}
     )
 
-# --- MODIFICA: Cattura l'IP dal request del client
 @app.post("/upload_chunk")
 async def upload_chunk(request: Request, client_id: str = Form(...), chunk_id: int = Form(...), file: UploadFile = File(...)):
+    """Riceve l'upload di un pezzo convertito e lo marca completato."""
     client_ip = request.client.host
     database.update_client_last_seen(client_id, time.time(), client_ip)
     
@@ -426,7 +462,7 @@ async def upload_chunk(request: Request, client_id: str = Form(...), chunk_id: i
     if not chunk:
         raise HTTPException(status_code=400, detail="Chunk not found")
         
-    if chunk['status'] == 'completato' : #or chunk['client_id'] != client_id
+    if chunk['status'] == 'completato' : # or chunk['client_id'] != client_id
         raise HTTPException(status_code=400, detail="Chunk assegnato a un altro client o già completato. File in ritardo scartato.")
         
     chunk_path = chunk['chunk_filename']
@@ -450,6 +486,7 @@ async def upload_chunk(request: Request, client_id: str = Form(...), chunk_id: i
 
 @app.get("/status_data", dependencies=[Depends(verify_auth)])
 def get_status_data():
+    """Fornisce tutti i JSON statistici necessari all'aggiornamento della pagina."""
     stats = database.get_dashboard_stats()
     stats["cartella_scansione"] = config.get("SCAN_DIR", ".")
     stats["is_paused"] = is_paused 
@@ -457,6 +494,7 @@ def get_status_data():
 
 @app.get("/logs_data", dependencies=[Depends(verify_auth)])
 def get_logs_data():
+    """Legge e formatta il file di testo contenente i log del server."""
     log_file_path = config.get("LOG_FILE", "server_log.txt")
     if not os.path.exists(log_file_path):
         return {"logs": "In attesa dei primi log...\n"}
@@ -472,6 +510,7 @@ def get_logs_data():
 
 @app.get("/", response_class=HTMLResponse)
 def get_dashboard(request: Request):
+    """Eroga l'interfaccia HTML completa del server Web."""
     if not is_authenticated(request):
         return RedirectResponse(url="/login", status_code=303)
         
@@ -540,6 +579,14 @@ def get_dashboard(request: Request):
                     <div class="form-group">
                         <label>Cartella in Scansione (SCAN_DIR):</label>
                         <input type="text" id="cfg-scan" placeholder=". (Cartella corrente)">
+                    </div>
+                    <div class="form-group">
+                        <label>Estensione Input (es. .mkv):</label>
+                        <input type="text" id="cfg-in-ext" placeholder=".mp4">
+                    </div>
+                    <div class="form-group">
+                        <label>Estensione Output (es. .mp4):</label>
+                        <input type="text" id="cfg-out-ext" placeholder=".mp4">
                     </div>
                     <div class="form-group">
                         <label>Percorso Database (DB_PATH):</label>
@@ -691,6 +738,8 @@ def get_dashboard(request: Request):
                     document.getElementById('cfg-log').value = cfg.LOG_FILE;
                     document.getElementById('cfg-scan').value = cfg.SCAN_DIR || ".";
                     document.getElementById('cfg-db').value = cfg.DB_PATH || "resizer.db";
+                    document.getElementById('cfg-in-ext').value = cfg.INPUT_EXT || ".mp4";
+                    document.getElementById('cfg-out-ext').value = cfg.OUTPUT_EXT || ".mp4";
                     document.getElementById('cfg-args').value = JSON.stringify(cfg.RESIZE_ARGS);
                 } catch (e) { console.error("Errore config:", e); }
             }
@@ -708,6 +757,8 @@ def get_dashboard(request: Request):
                         LOG_FILE: document.getElementById('cfg-log').value,
                         SCAN_DIR: document.getElementById('cfg-scan').value || ".",
                         DB_PATH: document.getElementById('cfg-db').value || "resizer.db",
+                        INPUT_EXT: document.getElementById('cfg-in-ext').value || ".mp4",
+                        OUTPUT_EXT: document.getElementById('cfg-out-ext').value || ".mp4",
                         RESIZE_ARGS: parsedArgs,
                         DASHBOARD_PASSWORD: document.getElementById('cfg-pass').value 
                     };
@@ -787,7 +838,6 @@ def get_dashboard(request: Request):
                             let statusColor = c.seconds_ago > limitWarning ? "#ff9800" : "#4caf50";
                             let icon = c.seconds_ago > limitWarning ? "⏳" : "🟢";
                             
-                            // MODIFICA: Recupero l'IP del client per mostrarlo nell'HTML
                             let ipInfo = c.ip_address ? c.ip_address : "Sconosciuto";
                             
                             clientsHtml += `

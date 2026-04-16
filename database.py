@@ -6,11 +6,12 @@ import time
 DB_PATH = 'resizer.db' 
 
 def set_db_path(path):
-    """Permette al server di impostare il percorso del database dal config.json"""
+    """Imposta il percorso del database letto dal file di configurazione."""
     global DB_PATH
     DB_PATH = path
 
 def clean_db():
+    """Elimina il file del database se esiste, utile per reset puliti."""
     if os.path.exists(DB_PATH):
         try:
             os.remove(DB_PATH)
@@ -19,11 +20,13 @@ def clean_db():
             print(f"Impossibile rimuovere il database: {e}")
 
 def get_connection():
+    """Crea e restituisce una connessione al database SQLite."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
+    """Inizializza le tabelle del database se non sono già presenti."""
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -36,11 +39,10 @@ def init_db():
         )
     ''')
     
-    # Trucchetto: Prova ad aggiungere la colonna se il database vecchio non ce l'ha!
     try:
         cursor.execute('ALTER TABLE Clients ADD COLUMN ip_address TEXT')
     except sqlite3.OperationalError:
-        pass # Se dà errore significa che la colonna c'è già, tutto ok!
+        pass 
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS Videos (
@@ -70,6 +72,7 @@ def init_db():
     conn.close()
 
 def save_client_benchmark(client_id, benchmark_time, ip_address):
+    """Salva o aggiorna i dati di benchmark e l'IP di un client."""
     conn = get_connection()
     cursor = conn.cursor()
     current_time = time.time()
@@ -82,6 +85,7 @@ def save_client_benchmark(client_id, benchmark_time, ip_address):
     conn.close()
 
 def get_client(client_id):
+    """Recupera le informazioni di un singolo client tramite il suo ID."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM Clients WHERE client_id = ?', (client_id,))
@@ -90,6 +94,7 @@ def get_client(client_id):
     return client
 
 def update_client_last_seen(client_id, current_time, ip_address):
+    """Aggiorna il timestamp dell'ultimo segnale di vita (heartbeat) del client."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('UPDATE Clients SET last_seen = ?, ip_address = ? WHERE client_id = ?', (current_time, ip_address, client_id))
@@ -97,6 +102,7 @@ def update_client_last_seen(client_id, current_time, ip_address):
     conn.close()
 
 def cleanup_inactive_clients(current_time):
+    """Rimuove dal database i client inattivi svincolando i loro chunk."""
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -126,6 +132,7 @@ def cleanup_inactive_clients(current_time):
     return len(da_eliminare)
 
 def insert_video(filename):
+    """Inserisce un nuovo video nella coda di elaborazione."""
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -144,13 +151,23 @@ def insert_video(filename):
     return None
 
 def update_video_final_size(video_id, final_size):
+    """Aggiorna la dimensione finale del video completato."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('UPDATE Videos SET final_size = ? WHERE id = ?', (final_size, video_id))
     conn.commit()
     conn.close()
 
+def update_video_filename(video_id, new_filename):
+    """Aggiorna il nome e l'estensione del video nel database a conversione finita."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE Videos SET filename = ? WHERE id = ?', (new_filename, video_id))
+    conn.commit()
+    conn.close()
+
 def set_video_priority(video_id, priorita):
+    """Modifica il livello di priorità di un video specifico."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('UPDATE Videos SET priorita = ? WHERE id = ?', (priorita, video_id))
@@ -158,6 +175,7 @@ def set_video_priority(video_id, priorita):
     conn.close()
 
 def get_video_by_status(status):
+    """Recupera il primo video disponibile con lo stato richiesto."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM Videos WHERE status = ? LIMIT 1', (status,))
@@ -166,6 +184,7 @@ def get_video_by_status(status):
     return video
 
 def get_videos_by_status(status):
+    """Recupera tutti i video che corrispondono a un determinato stato."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM Videos WHERE status = ?', (status,))
@@ -174,6 +193,7 @@ def get_videos_by_status(status):
     return videos
 
 def get_video_by_id(video_id):
+    """Cerca e restituisce un video tramite il suo ID primario."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM Videos WHERE id = ?', (video_id,))
@@ -182,6 +202,7 @@ def get_video_by_id(video_id):
     return video
 
 def update_video_status(video_id, status):
+    """Aggiorna lo stato di avanzamento di un video."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('UPDATE Videos SET status = ? WHERE id = ?', (status, video_id))
@@ -189,6 +210,7 @@ def update_video_status(video_id, status):
     conn.close()
 
 def insert_chunk(video_id, chunk_filename):
+    """Inserisce un singolo pezzo (chunk) associato al suo video originale."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
@@ -199,6 +221,7 @@ def insert_chunk(video_id, chunk_filename):
     conn.close()
 
 def get_chunks_by_video(video_id):
+    """Restituisce tutti i chunk appartenenti a un dato video in ordine sequenziale."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM Chunks WHERE video_id = ? ORDER BY id ASC', (video_id,))
@@ -207,6 +230,7 @@ def get_chunks_by_video(video_id):
     return chunks
 
 def get_chunk_by_id(chunk_id):
+    """Recupera un singolo chunk utilizzando il suo ID univoco."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM Chunks WHERE id = ?', (chunk_id,))
@@ -215,6 +239,7 @@ def get_chunk_by_id(chunk_id):
     return chunk
 
 def get_stale_chunks(current_time):
+    """Individua i chunk bloccati da troppo tempo per essere riassegnati."""
     conn = get_connection()
     cursor = conn.cursor()
     query = '''
@@ -238,6 +263,7 @@ def get_stale_chunks(current_time):
     return stale_chunks
 
 def reset_chunk(chunk_id):
+    """Riporta lo stato di un chunk a 'in_attesa' rimuovendo il client assegnato."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
@@ -249,6 +275,7 @@ def reset_chunk(chunk_id):
     conn.close()
 
 def assign_pending_chunk(client_id, current_time):
+    """Trova un chunk libero e lo assegna al client richiedente gestendo la priorità."""
     max_tentativi = 5 
     for tentativo in range(max_tentativi):
         conn = get_connection()
@@ -295,6 +322,7 @@ def assign_pending_chunk(client_id, current_time):
     return None
 
 def update_chunk_status(chunk_id, status):
+    """Aggiorna lo stato lavorativo di un singolo chunk."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('UPDATE Chunks SET status = ? WHERE id = ?', (status, chunk_id))
@@ -302,6 +330,7 @@ def update_chunk_status(chunk_id, status):
     conn.close()
 
 def are_all_chunks_completed(video_id):
+    """Verifica se tutti i pezzi di un video sono stati contrassegnati come completati."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT COUNT(*) as count FROM Chunks WHERE video_id = ? AND status != "completato"', (video_id,))
@@ -310,6 +339,7 @@ def are_all_chunks_completed(video_id):
     return row['count'] == 0
 
 def get_remaining_chunks_count(video_id):
+    """Restituisce il numero di chunk rimanenti per un determinato video."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT COUNT(*) as count FROM Chunks WHERE video_id = ? AND status != "completato"', (video_id,))
@@ -318,6 +348,7 @@ def get_remaining_chunks_count(video_id):
     return row['count']
 
 def get_dashboard_stats():
+    """Genera e aggrega tutte le statistiche per popolare l'interfaccia della Dashboard."""
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -331,7 +362,6 @@ def get_dashboard_stats():
     }
     
     current_time = time.time()
-    # Adesso peschiamo anche l'IP!
     cursor.execute('SELECT client_id, benchmark_time, last_seen, ip_address FROM Clients ORDER BY last_seen DESC')
     clients_db = cursor.fetchall()
     
@@ -400,6 +430,7 @@ def get_dashboard_stats():
     return stats
 
 def get_all_videos():
+    """Restituisce l'elenco completo di tutti i video a prescindere dallo stato."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM Videos')
@@ -408,6 +439,7 @@ def get_all_videos():
     return videos
 
 def delete_video(video_id):
+    """Elimina definitivamente un video e i suoi chunk dal database."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('DELETE FROM Chunks WHERE video_id = ?', (video_id,))

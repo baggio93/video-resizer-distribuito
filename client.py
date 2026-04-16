@@ -11,24 +11,26 @@ import sys
 SERVER_URL = "http://127.0.0.1:50123"
 CLIENT_ID = str(uuid.uuid4())
 keep_running = True  
-server_config = {}   # Conterrà le configurazioni scaricate dal server
+server_config = {}   
 
 # --- GESTIONE DELLA CHIUSURA SICURA (CTRL+C) ---
 def signal_handler(sig, frame):
+    """Gestisce la terminazione del processo (Ctrl+C) permettendo una chiusura senza file corrotti."""
     global keep_running
     if keep_running:
-        print("\n\n⚠️ RICEVUTO COMANDO DI SPEGNIMENTO (Ctrl+C) ⚠️")
-        print("⏳ Sto terminando il pezzo in corso. Lo invierò al server e poi mi spegnerò in sicurezza...")
-        print("   (Premi di nuovo Ctrl+C se vuoi forzare l'uscita brutale perdendo il lavoro)\n")
+        print("\n\n[ATTENZIONE] RICEVUTO COMANDO DI SPEGNIMENTO (Ctrl+C)")
+        print("[ATTESA] Sto terminando il pezzo in corso. Lo inviero' al server e poi mi spegnero' in sicurezza...")
+        print("         (Premi di nuovo Ctrl+C se vuoi forzare l'uscita brutale perdendo il lavoro)\n")
         keep_running = False
     else:
-        print("\n💀 Chiusura forzata!")
+        print("\n[ERRORE] Chiusura forzata!")
         sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 # -----------------------------------------------
 
 def clean_leftover_files():
+    """Rimuove eventuali file temporanei interrotti rimasti da esecuzioni passate del client."""
     print("--- PULIZIA INIZIALE ---")
     files_to_check = ["local_benchmark.mp4", "local_benchmark_out.mp4"]
     for file in os.listdir('.'):
@@ -41,6 +43,7 @@ def clean_leftover_files():
     print("Pulizia completata.\n------------------------\n")
 
 def scarica_configurazioni():
+    """Contatta il server per recuperare le impostazioni aggiornate sulle estensioni e i parametri."""
     global server_config
     try:
         print("Scaricamento configurazioni aggiornate dal server...")
@@ -52,7 +55,7 @@ def scarica_configurazioni():
         sys.exit(1)
 
 def run_benchmark():
-    """Scarica il file, testa la velocità della CPU e si registra al server"""
+    """Esegue un test iniziale di rendering per calcolare la velocità del client e lo registra al server."""
     print("\n--- AVVIO BENCHMARK/REGISTRAZIONE ---")
     try:
         res = requests.get(f"{SERVER_URL}/benchmark", stream=True)
@@ -62,7 +65,10 @@ def run_benchmark():
 
         print("Esecuzione test di conversione (FFmpeg)...")
         start_time = time.time()
-        args = ["ffmpeg", "-y", "-i", "local_benchmark.mp4"] + server_config["RESIZE_ARGS"] + ["local_benchmark_out.mp4"]
+        out_ext = server_config.get("OUTPUT_EXT", ".mp4")
+        bench_out = f"local_benchmark_out{out_ext}"
+        
+        args = ["ffmpeg", "-y", "-i", "local_benchmark.mp4"] + server_config["RESIZE_ARGS"] + [bench_out]
         subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elapsed = time.time() - start_time
 
@@ -70,12 +76,11 @@ def run_benchmark():
         requests.post(f"{SERVER_URL}/benchmark_result", json={"client_id": CLIENT_ID, "benchmark_time": elapsed})
 
         if os.path.exists("local_benchmark.mp4"): os.remove("local_benchmark.mp4")
-        if os.path.exists("local_benchmark_out.mp4"): os.remove("local_benchmark_out.mp4")
+        if os.path.exists(bench_out): os.remove(bench_out)
         
         print(f"--- BENCHMARK CONCLUSO: {elapsed:.2f} sec ---\n")
     except Exception as e:
         print(f"Errore critico durante il benchmark: {e}")
-        # Invece di uscire forzatamente, aspettiamo un po' e proviamo a continuare, magari il server è appena ripartito.
         time.sleep(5)
 
 if __name__ == "__main__":
@@ -86,7 +91,6 @@ if __name__ == "__main__":
     
     clean_leftover_files()
     
-    # Primo caricamento
     scarica_configurazioni()
     run_benchmark()
 
@@ -96,15 +100,12 @@ if __name__ == "__main__":
         try:
             res = requests.get(f"{SERVER_URL}/get_chunk", params={"client_id": CLIENT_ID}, timeout=5)
             
-            # --- FUNZIONE DI AUTO-RECOVERY ---
-            # Se il server risponde con Errore 400 (Client non registrato)
             if res.status_code == 400:
-                print(f"[{time.strftime('%H:%M:%S')}] ⚠️ Il server ha perso la mia registrazione (Errore 400).")
+                print(f"[{time.strftime('%H:%M:%S')}] [ATTENZIONE] Il server ha perso la mia registrazione (Errore 400).")
                 print("Eseguo nuovamente la registrazione (Auto-Recovery)...")
                 scarica_configurazioni() 
                 run_benchmark()
                 continue
-            # ---------------------------------
             
             if res.status_code == 404:
                 for _ in range(5):
@@ -119,8 +120,11 @@ if __name__ == "__main__":
                 time.sleep(5)
                 continue
 
-            input_chunk = f"chunk_in_{chunk_id}.mp4"
-            output_chunk = f"chunk_out_{chunk_id}.mp4"
+            in_ext = server_config.get("INPUT_EXT", ".mp4")
+            out_ext = server_config.get("OUTPUT_EXT", ".mp4")
+            
+            input_chunk = f"chunk_in_{chunk_id}{in_ext}"
+            output_chunk = f"chunk_out_{chunk_id}{out_ext}"
 
             with open(input_chunk, "wb") as f:
                 for chunk in res.iter_content(chunk_size=8192):
@@ -132,7 +136,7 @@ if __name__ == "__main__":
             subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
             if not os.path.exists(output_chunk):
-                print(f"[{time.strftime('%H:%M:%S')}] Errore di conversione. Riproverò al prossimo ciclo.")
+                print(f"[{time.strftime('%H:%M:%S')}] Errore di conversione. Riprovero' al prossimo ciclo.")
                 time.sleep(5)
                 continue
 
@@ -164,4 +168,4 @@ if __name__ == "__main__":
                 if not keep_running: break
                 time.sleep(1)
                 
-    print("\n👋 Client terminato in modo sicuro. Nessun lavoro è andato perso! A presto.")
+    print("\n[CHIUSURA] Client terminato in modo sicuro. Nessun lavoro e' andato perso! A presto.")
